@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
+
+# Generated artifacts (regenerate with `python main.py`)
+outputs/*.png
+outputs/*.csv
