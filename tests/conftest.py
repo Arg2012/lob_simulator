@@ -1,4 +1,9 @@
-"""Make the project root importable so `import src.*` works under pytest."""
+"""Pytest configuration: make the flat source modules importable.
+
+The source files live in the project root (one level up from ``tests/``), so
+we add that directory to ``sys.path``. This lets tests do ``from
+matching_engine import MatchingEngine`` without a package install.
+"""
 
 import os
 import sys

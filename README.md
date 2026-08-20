@@ -1,283 +1,193 @@
 # High-Frequency Limit Order Book Simulator
 
 An event-driven **limit order book (LOB)** and **matching engine**, written from
-scratch in Python. It supports limit orders, market orders, cancellations and
-FIFO queue dynamics; reconstructs order books from historical event streams; and
-is used to study spread, depth, inventory and execution quality across different
-market regimes.
+scratch in Python (no external order-book or matching-engine libraries). It
+supports limit orders, market orders and cancellations; reconstructs order books
+from historical event streams; and is used to analyse spread, depth, inventory
+and execution quality across different market conditions.
 
-The project is deliberately compact and readable. Every component — the book, the
-matching engine, the event system, the replay layer and the market-making agent —
-is small enough to reason about, yet the pieces compose into a realistic
+The project is deliberately compact and readable. Every component — the book,
+the matching engine, the event system, the replay layer and the market-making
+agent — is small enough to reason about, yet the pieces compose into a realistic
 microstructure sandbox.
 
 ---
 
-## Highlights
+## What is a limit order book?
 
-- **Price-time-priority matching engine** — better prices match first; within a
-  price level, earlier orders match first (strict FIFO).
-- **Full order lifecycle** — limit buys/sells, market buys/sells, partial fills,
-  multi-level sweeps and cancellations.
-- **Event-driven core** — everything is a stream of `ADD_ORDER` / `MARKET_ORDER` /
-  `CANCEL_ORDER` events, so synthetic and historical data share one code path.
-- **Historical replay** — reconstruct a book from a CSV of events, exactly as you
-  would from a real exchange feed.
-- **Synthetic markets** — three regimes: *normal*, *high volatility*, *low
-  liquidity*, each with distinct order flow.
-- **Market-making agent** — posts two-sided quotes, skews on inventory, and tracks
-  realised / unrealised PnL.
-- **Metrics & plots** — spread, depth, inventory, PnL, fill rate and slippage,
-  with publication-quality figures saved to `outputs/`.
-- **Tested** — a `pytest` suite covering FIFO, partial fills, multi-level matching,
-  cancellations and book invariants.
+A limit order book is the data structure an exchange uses to record all
+outstanding buy and sell interest in an instrument.
 
----
+- A **bid** is a resting buy order (a price someone will pay).
+- An **ask / offer** is a resting sell order (a price someone will accept).
+- The **best bid** is the highest bid; the **best ask** is the lowest ask.
+- The **spread** is `best ask − best bid`; the **midpoint** is their average.
+- **Depth** is the total quantity resting at (or across) price levels.
 
-## Project structure
+Orders arrive as *events* and either rest in the book (adding liquidity) or
+match against resting orders (removing liquidity).
 
-```
-lob_simulator/
-├── src/
-│   ├── order.py            # Order, Side, OrderType
-│   ├── trade.py            # Trade record
-│   ├── events.py           # Event vocabulary (ADD / CANCEL / MARKET)
-│   ├── order_book.py       # The book: price levels, FIFO queues, id lookup
-│   ├── matching_engine.py  # Price-time-priority crossing logic
-│   ├── replay.py           # CSV load/write + historical replay
-│   ├── simulator.py        # Synthetic order flow + end-to-end run loop
-│   ├── market_maker.py     # Inventory-aware market-making agent
-│   ├── metrics.py          # Execution-quality metrics
-│   └── plots.py            # Matplotlib figures
-├── data/
-│   └── sample_events.csv   # Generated synthetic event stream (several thousand)
-├── tests/                  # pytest suite
-├── outputs/                # Generated figures + metrics_summary.csv
-├── main.py                 # Demo driver: generate → replay → simulate → plot
-└── README.md
-```
+## Price-time priority
 
----
+When two orders can trade, the exchange must decide which resting order gets
+filled first. The near-universal rule is **price-time priority**:
 
-## How it works
+1. **Price priority** — better prices always execute first. A buy matches the
+   lowest ask available; a sell matches the highest bid available.
+2. **Time priority (FIFO)** — among orders at the *same* price, the one that
+   arrived first is filled first.
 
-### The order book
+In this project each price level is a FIFO queue (`collections.deque`). New
+orders append to the back; matching consumes from the front. Selecting the best
+price level, then draining it front-to-back, gives strict price-then-time
+priority for free.
 
-Each side of the book is a dictionary mapping `price -> PriceLevel`, and each
-`PriceLevel` holds a `collections.deque` of resting orders. Alongside each side we
-keep a **sorted list of live prices**, maintained with `bisect`. This gives:
+## How the matching engine works
 
-| Operation                | Cost                                   |
-|--------------------------|----------------------------------------|
-| best bid / best ask      | `O(1)` (peek the sorted list)          |
-| add a new price level    | `O(k)` (bisect insort)                 |
-| cancel / drop a level    | `O(k)` + `O(1)` id lookup              |
-| cancel by order id       | `O(1)` lookup + `O(q)` queue removal   |
+`matching_engine.py` is the single source of truth for matching. Every state
+change is expressed as an `Event` and pushed through
+`MatchingEngine.process_event`:
 
-where `k` is the number of *distinct* price levels and `q` the depth of a single
-queue — both small in practice. Order-id lookup is a flat dict, so cancellations
-are effectively constant time.
+- **Limit order** — matches against the opposite side while it is *marketable*
+  (its price crosses the best opposite price), then rests any remainder in the
+  book.
+- **Market order** — has no price, so it **sweeps across price levels** until it
+  is filled or the opposite side is exhausted; any unfilled remainder is
+  discarded (market orders never rest).
+- **Cancellation** — removes a resting order via an O(1) order-id lookup.
 
-The book exposes exactly the queries a microstructure study needs: `best_bid`,
-`best_ask`, `spread`, `midpoint`, `bid_depth`, `ask_depth` and a full
-`depth_snapshot`.
+Every match emits a `Trade`, printed at the **resting order's price** (price
+improvement accrues to the aggressor). Partial fills are handled by decrementing
+the `remaining` quantity on both the incoming and resting orders.
 
-### Price-time priority (the matching rule)
+## How event replay reconstructs the book
 
-When an aggressive order arrives, the engine walks the **opposite** side of the
-book from the best price outward:
+`replay.py` reads a CSV event stream and re-applies every event, in order,
+through the **same** matching engine used by the live simulator. Because the
+book is a pure function of the ordered event history, reconstruction *is* replay:
+after event *k* the book is exactly what it was at that point in time. You can
+stop at any index (`replay(events, up_to=k)`) to inspect the book at any
+historical moment.
 
-1. **Price priority** — it consumes the best price level first, then the next,
-   and so on.
-2. **Time priority** — within a level it always fills the *front* of the FIFO
-   queue first (the earliest-arriving order).
-3. Every fill executes at the **resting (maker) order's price**, so the aggressor
-   receives price improvement — just like a real exchange.
+The replay engine is agnostic about where events come from. The bundled
+`data/sample_events.csv` is **synthetic** (generated by this project — it is not
+real exchange data), but a real exchange message feed converted to the same CSV
+schema could be replayed **without changing a single line of matching logic**.
 
-### Matching logic
-
-- **Market order** — takes liquidity across as many levels as needed until it is
-  filled or the book is empty. Any unfilled remainder is discarded (a market order
-  has no price at which to rest).
-- **Limit order** — first crosses against any *marketable* liquidity (opposite
-  orders at or better than its limit price). It stops as soon as the best opposite
-  price is beyond its limit, and any remaining quantity **rests** in the book.
-- **Cancellation** — removes a resting order by id in `O(1)` lookup, tidying up the
-  price level (and the sorted-price list) if it becomes empty.
-
-The book maintains a `check_invariants()` guard used by the tests and after each
-simulation run: the book is never crossed, every level's cached quantity equals
-the sum of its orders, and the sorted-price lists mirror the level dictionaries.
-
-### The event system
-
-Everything runs through a single event vocabulary (`events.py`):
-
-```
-ADD_ORDER      submit a resting limit order
-MARKET_ORDER   cross the spread and take liquidity
-CANCEL_ORDER   remove a resting order by id
-```
-
-`replay.apply_event` is the one function translating events into engine calls, so
-**synthetic simulation and historical replay share the same execution path**. That
-is the seam that makes it easy to swap in real exchange data later — only the
-producer of events changes.
-
-### Historical replay
-
-`replay.py` reconstructs a book by processing every event in a CSV sequentially.
-The schema is intentionally exchange-agnostic:
+CSV schema:
 
 ```
 timestamp,event_type,order_id,side,price,quantity
-0.000000,ADD_ORDER,1,BUY,99.99,6
-0.000000,ADD_ORDER,2,SELL,100.01,6
-1.284000,MARKET_ORDER,842,SELL,,4
-1.902000,CANCEL_ORDER,17,BUY,,
+0,ADD_ORDER,1,SELL,99.98,5      # a limit order
+0,MARKET_ORDER,2,BUY,,3         # a market order (no price)
+0,CANCEL_ORDER,4,,,             # cancel order id 4
 ```
 
-To use real data, map your feed into these columns and call `replay_file(path)`.
+## How the simulator generates synthetic markets
 
-### Simulation
+`simulator.py` is a sequential **event loop**. On each step it (1) lets the
+market maker re-quote, (2) generates a batch of synthetic background order flow,
+(3) feeds every event through the shared matching engine, and (4) records a
+snapshot of the book and agent state.
 
-`simulator.py` contains a small, transparent order-flow model. A latent mid-price
-follows a random walk; each event is probabilistically a market order, a
-cancellation, or a new limit order placed a few ticks off the mid. Three scenarios
-parameterise it:
+Background flow is driven by a latent, mean-reverting fair value that random-
+walks each step. Buy limits are posted below it, sell limits above it (building
+a two-sided book); market orders consume liquidity; cancels remove resting
+orders. All randomness is seeded, so runs are reproducible.
 
-| Scenario          | Character                                             |
-|-------------------|-------------------------------------------------------|
-| `normal`          | Moderate volatility, tight spread, deep book          |
-| `high_volatility` | Large price steps, more aggressive flow, thinner book |
-| `low_liquidity`   | Sparse arrivals, small sizes, shallow book            |
+Three scenarios share the generator with different parameters:
 
-### The market-making agent
+| Scenario          | Volatility | Market-order rate | Liquidity posted | Effect                         |
+|-------------------|-----------:|------------------:|-----------------:|--------------------------------|
+| `normal`          | low        | moderate          | high             | tight spread, deep book        |
+| `high_volatility` | high       | high              | high             | wide spread, book churns fast  |
+| `low_liquidity`   | low        | high              | low              | thin book, wider spread        |
 
-`market_maker.py` posts a two-sided quote around the mid every few events. It:
+Each scenario is evaluated from two angles so neither contaminates the other:
 
-- places a **bid** and an **ask** at `mid ± half_spread`,
-- **skews** both quotes against its inventory (a growing long position lowers both
-  quotes, encouraging it to sell and mean-revert toward flat),
-- stops quoting a side that would breach its inventory cap,
-- tracks **inventory**, **realised PnL** (average-cost accounting on round-trips)
-  and **unrealised PnL** (mark-to-market of the open position at the mid).
+- **Market conditions** — the flow run *without* the market maker. Its spread and
+  depth describe the market's intrinsic liquidity.
+- **Agent execution** — the same seeded flow run *with* the market maker
+  participating. Its inventory, PnL, fill rate and slippage measure how the
+  agent performs in that market.
 
-### Analysis & metrics
+## The market maker
 
-`metrics.py` computes, per run: average / median spread, average bid & ask depth,
-inventory through time, realised / unrealised / total PnL, **fill rate** (fraction
-of submitted limit orders that executed) and **slippage** (market-order execution
-VWAP versus the pre-trade mid). `plots.py` renders mid-price, spread, depth,
-inventory and PnL time series, a book-depth snapshot, and a cross-scenario
-comparison — all saved to `outputs/`.
+`market_maker.py` is a deliberately trivial, symmetric market maker: on every
+step it cancels its previous quotes and re-posts a fresh bid and ask a fixed
+number of ticks either side of the mid. It exists only to generate an inventory
+and PnL series to analyse — there is no alpha or inventory skew. Accounting uses
+the average-cost method:
+
+- **Inventory** — signed position (positive = long).
+- **Realised PnL** — locked in whenever a fill reduces the position, valued
+  against the running average entry price.
+- **Unrealised PnL** — the open position marked to the current mid.
+- **Total PnL** — realised + unrealised.
+
+## How the metrics are calculated
+
+`metrics.py` summarises each scenario:
+
+- **Average spread** — mean of `best ask − best bid` over the run.
+- **Average bid / ask depth** — mean total resting quantity per side.
+- **Average slippage** — for each market order, the average fill price versus the
+  mid *just before* it arrived (positive = adverse); averaged over all market
+  orders. A proxy for execution cost / market impact.
+- **Inventory** — the market maker's position over time (final and peak).
+- **Fill rate** — fraction of the market maker's quoted volume that executed.
+- **Realised / total PnL** — the market maker's PnL at the end of the run.
+
+`plots.py` overlays the three scenarios in five figures (midprice, spread, depth,
+inventory, PnL) and saves them to `outputs/`.
 
 ---
 
-## Getting started
+## Project layout
 
-### Requirements
-
-- Python 3.11+
-- `numpy`, `pandas`, `matplotlib`, `pytest`
-
-```bash
-pip install numpy pandas matplotlib pytest
+```
+lob_simulator/
+    main.py              # end-to-end driver
+    order.py             # Order dataclass, Side / OrderType enums
+    trade.py             # Trade dataclass
+    events.py            # Event model + CSV (de)serialisation
+    order_book.py        # the central limit order book
+    matching_engine.py   # price-time priority matching
+    replay.py            # historical event-stream reconstruction
+    simulator.py         # event loop + synthetic scenarios
+    market_maker.py      # simple two-sided market maker
+    metrics.py           # spread / depth / inventory / execution metrics
+    plots.py             # matplotlib comparison plots
+    data/sample_events.csv   # SYNTHETIC event stream (not real market data)
+    outputs/             # generated plots + metrics_summary.csv
+    tests/               # pytest suite
 ```
 
-### Run the full demo
+## Running the project
 
-Generates the sample event stream, demonstrates replay, runs all three scenarios,
-prints a metrics table and writes every figure to `outputs/`:
+Install dependencies (Python 3.11+):
 
-```bash
+```
+pip install -r requirements.txt
+```
+
+Run the full demo (generates data, reconstructs the book, runs all three
+scenarios, prints the metrics table, saves the plots):
+
+```
 python main.py
 ```
 
-Options:
+Run the test suite:
 
-```bash
-python main.py --events 8000     # more events per scenario / larger sample
-python main.py --seed 7          # different random seed (fully reproducible)
 ```
-
-### Run the tests
-
-```bash
 python -m pytest -q
 ```
 
-### Use it as a library
+## A note on the data
 
-```python
-from src.matching_engine import MatchingEngine
-from src.order import Order, OrderType, Side
-
-engine = MatchingEngine()
-engine.submit_limit_order(Order(1, Side.SELL, 5, 100.0, OrderType.LIMIT))
-engine.submit_limit_order(Order(2, Side.SELL, 5, 101.0, OrderType.LIMIT))
-
-# A market buy sweeps the book in price-time priority.
-trades = engine.submit_market_order(Order(3, Side.BUY, 7, None, OrderType.MARKET))
-for t in trades:
-    print(t.quantity, "@", t.price)      # 5 @ 100.0, then 2 @ 101.0
-
-print("best ask:", engine.book.best_ask())   # 101.0 (3 left resting)
-```
-
-Replay a historical file:
-
-```python
-from src.replay import replay_file
-engine = replay_file("data/sample_events.csv")
-print(engine.book.best_bid(), engine.book.best_ask(), engine.book.spread())
-```
-
-Run a scenario and compute metrics:
-
-```python
-from src.simulator import run_scenario
-from src.metrics import format_metrics
-
-result = run_scenario("high_volatility", n_events=5000, seed=0)
-print(format_metrics(result))
-```
-
----
-
-## Reading the results
-
-Some findings worth discussing (produced by `python main.py`):
-
-- **Spread widens with volatility.** The `high_volatility` scenario shows a
-  materially larger average spread and higher market-order slippage than `normal`.
-- **The naive market maker is adversely selected.** In trending / volatile regimes
-  its inventory drifts toward the cap and it loses money — a textbook illustration
-  of *inventory risk* and *adverse selection*. This is exactly what motivates the
-  inventory-skew term (and, in a richer model, dynamic spread widening and hedging).
-- **Depth and fill rate move together with liquidity.** The `low_liquidity`
-  scenario has a shallow book and a lower limit-order fill rate.
-
-These are honest outputs of a simple model — the point is that the simulator is
-rich enough to *observe* real microstructure effects and to serve as a testbed for
-smarter strategies.
-
----
-
-## Design notes
-
-- **Separation of concerns.** The book *stores* liquidity; the engine *consumes*
-  it; the simulator *produces* events; the agent *reacts*. Each can be tested and
-  swapped independently.
-- **One execution path.** Synthetic and historical flow both go through
-  `apply_event`, which keeps replay and simulation honest with respect to each
-  other.
-- **From scratch.** No third-party order-book library is used — the matching
-  engine, queues and priority logic are all implemented here.
-
-## Possible extensions
-
-- Iceberg / hidden orders, order modification (price/size amends).
-- Latency modelling and a proper discrete-event scheduler.
-- Smarter agents (Avellaneda–Stoikov market making, execution algos like TWAP/VWAP).
-- Ingest a real L3 message feed by mapping it onto the existing event schema.
+All data in this repository is **synthetic** and generated by the code with
+fixed random seeds. It is not real exchange data and is not intended to resemble
+any specific instrument or venue. The replay engine is structured so that a real
+exchange message dataset could be substituted by converting it to the CSV schema
+above.

@@ -1,159 +1,180 @@
-"""Unit tests for the matching engine: FIFO, market/limit execution,
-partial fills, cancellations and multi-level matching."""
+"""Tests for the matching engine: price priority, FIFO, partial fills,
+market-order sweeping, cancellations and book invariants.
 
-import itertools
+These are the core correctness tests that demonstrate the engine behaves like a
+genuine price-time priority matcher.
+"""
 
-import pytest
+import random
 
-from src.matching_engine import MatchingEngine
-from src.order import Order, OrderType, Side
-
-_ids = itertools.count(1)
-
-
-def limit(side, price, qty, ts=0.0, owner="background"):
-    return Order(next(_ids), side, qty, price, OrderType.LIMIT, ts, owner)
+from events import add_order, cancel_order, market_order
+from matching_engine import MatchingEngine
+from order import Side
 
 
-def market(side, qty, ts=0.0):
-    return Order(next(_ids), side, qty, None, OrderType.MARKET, ts)
+def add(eng, ts, oid, side, price, qty):
+    return eng.process_event(add_order(ts, oid, side, price, qty))
 
 
-# --------------------------------------------------------------------- FIFO
-def test_fifo_time_priority_within_price_level():
-    """At one price, the earliest-arriving order must fill first."""
+def test_price_priority_best_price_fills_first():
+    """A buy must hit the lowest ask, regardless of arrival order."""
     eng = MatchingEngine()
-    a = limit(Side.SELL, 100.0, 5, ts=1.0)
-    b = limit(Side.SELL, 100.0, 5, ts=2.0)
-    eng.submit_limit_order(a)
-    eng.submit_limit_order(b)
+    add(eng, 0, 1, Side.SELL, 101.0, 5)   # worse (higher) ask, arrived first
+    add(eng, 1, 2, Side.SELL, 100.0, 5)   # better (lower) ask, arrived second
 
-    trades = eng.submit_market_order(market(Side.BUY, 5))
+    trades = add(eng, 2, 3, Side.BUY, 101.0, 5)  # marketable buy
+
     assert len(trades) == 1
-    assert trades[0].maker_order_id == a.order_id  # 'a' arrived first
-    # 'b' should be untouched and still resting at full size.
-    assert eng.book.orders[b.order_id].quantity == 5
+    assert trades[0].price == 100.0            # best price filled first
+    assert trades[0].maker_order_id == 2
+    # The 101.0 ask is untouched.
+    assert eng.book.depth_at(Side.SELL, 101.0) == 5
 
 
-def test_fifo_across_two_makers_partial_second():
+def test_time_priority_fifo_within_level():
+    """Within one price level, the earliest order fills first (FIFO)."""
     eng = MatchingEngine()
-    a = limit(Side.SELL, 100.0, 4, ts=1.0)
-    b = limit(Side.SELL, 100.0, 4, ts=2.0)
-    eng.submit_limit_order(a)
-    eng.submit_limit_order(b)
+    add(eng, 0, 1, Side.SELL, 100.0, 5)   # arrived first
+    add(eng, 1, 2, Side.SELL, 100.0, 5)   # arrived second
 
-    trades = eng.submit_market_order(market(Side.BUY, 6))
-    # 4 from a (fully), 2 from b (partial) — in that order.
-    assert [t.maker_order_id for t in trades] == [a.order_id, b.order_id]
-    assert [t.quantity for t in trades] == [4, 2]
-    assert a.order_id not in eng.book.orders
-    assert eng.book.orders[b.order_id].quantity == 2
+    trades = eng.process_event(market_order(2, 3, Side.BUY, 5))
+
+    assert len(trades) == 1
+    assert trades[0].maker_order_id == 1   # oldest at the level filled first
+    assert eng.book.depth_at(Side.SELL, 100.0) == 5  # order 2 still resting
 
 
-# ------------------------------------------------------------- market orders
-def test_market_order_consumes_multiple_levels():
+def test_partial_fill_rests_remainder():
+    """A marketable limit order fills what it can and rests the rest."""
     eng = MatchingEngine()
-    eng.submit_limit_order(limit(Side.SELL, 100.0, 3))
-    eng.submit_limit_order(limit(Side.SELL, 101.0, 3))
-    eng.submit_limit_order(limit(Side.SELL, 102.0, 3))
+    add(eng, 0, 1, Side.SELL, 100.0, 3)          # only 3 available
+    trades = add(eng, 1, 2, Side.BUY, 100.0, 10)  # wants 10
 
-    trades = eng.submit_market_order(market(Side.BUY, 7))
-    assert sum(t.quantity for t in trades) == 7
-    # Prices consumed from best (100) outward.
-    assert [t.price for t in trades] == [100.0, 101.0, 102.0]
-    assert [t.quantity for t in trades] == [3, 3, 1]
-    # 102 level should retain the leftover 2.
-    assert eng.book.ask_depth() == 2
-
-
-def test_market_order_exhausts_book_and_discards_remainder():
-    eng = MatchingEngine()
-    eng.submit_limit_order(limit(Side.SELL, 100.0, 2))
-    trades = eng.submit_market_order(market(Side.BUY, 10))
-    assert sum(t.quantity for t in trades) == 2
-    assert eng.book.best_ask() is None  # book emptied
-    # No resting remainder: market orders never rest.
-    assert len(eng.book.orders) == 0
-
-
-# ------------------------------------------------------------ limit crossing
-def test_marketable_limit_executes_then_rests_remainder():
-    eng = MatchingEngine()
-    eng.submit_limit_order(limit(Side.SELL, 100.0, 4))
-    # Buy 10 @ 100: 4 execute, 6 rest as the new best bid.
-    taker = limit(Side.BUY, 100.0, 10)
-    trades = eng.submit_limit_order(taker)
-    assert sum(t.quantity for t in trades) == 4
+    assert sum(t.quantity for t in trades) == 3
+    assert eng.book.best_ask() is None           # ask consumed
+    # Remaining 7 rests on the bid at 100.0.
     assert eng.book.best_bid() == 100.0
-    assert eng.book.orders[taker.order_id].quantity == 6
+    assert eng.book.depth_at(Side.BUY, 100.0) == 7
 
 
-def test_non_marketable_limit_just_rests():
+def test_resting_order_partial_fill_keeps_remainder():
+    """A resting order that is partially hit keeps its remaining quantity."""
     eng = MatchingEngine()
-    eng.submit_limit_order(limit(Side.SELL, 101.0, 5))
-    taker = limit(Side.BUY, 100.0, 5)  # below best ask -> not marketable
-    trades = eng.submit_limit_order(taker)
+    add(eng, 0, 1, Side.SELL, 100.0, 10)
+    trades = eng.process_event(market_order(1, 2, Side.BUY, 4))
+
+    assert sum(t.quantity for t in trades) == 4
+    assert eng.book.depth_at(Side.SELL, 100.0) == 6
+    assert eng.book.orders[1].remaining == 6
+
+
+def test_market_order_sweeps_multiple_levels():
+    """A market order walks across price levels until filled."""
+    eng = MatchingEngine()
+    add(eng, 0, 1, Side.SELL, 100.0, 2)
+    add(eng, 1, 2, Side.SELL, 100.5, 2)
+    add(eng, 2, 3, Side.SELL, 101.0, 2)
+
+    trades = eng.process_event(market_order(3, 4, Side.BUY, 5))
+
+    assert sum(t.quantity for t in trades) == 5
+    prices = [t.price for t in trades]
+    assert prices == [100.0, 100.5, 101.0]    # in price order
+    assert [t.quantity for t in trades] == [2, 2, 1]
+    # 1 unit left resting at the top level.
+    assert eng.book.depth_at(Side.SELL, 101.0) == 1
+
+
+def test_limit_order_rests_when_not_marketable():
+    """A non-crossing limit order simply rests; no trades."""
+    eng = MatchingEngine()
+    add(eng, 0, 1, Side.SELL, 101.0, 5)
+    trades = add(eng, 1, 2, Side.BUY, 100.0, 5)  # below best ask
+
     assert trades == []
     assert eng.book.best_bid() == 100.0
-    assert eng.book.spread() == pytest.approx(1.0)
+    assert eng.book.best_ask() == 101.0
 
 
-def test_limit_respects_price_limit_across_levels():
-    """A limit buy must not fill against asks above its limit price."""
+def test_market_order_stops_when_book_empty():
+    """A market order with no liquidity left simply stops (remainder dropped)."""
     eng = MatchingEngine()
-    eng.submit_limit_order(limit(Side.SELL, 100.0, 3))
-    eng.submit_limit_order(limit(Side.SELL, 101.0, 3))
-    taker = limit(Side.BUY, 100.0, 6)  # willing to pay only up to 100
-    trades = eng.submit_limit_order(taker)
-    assert sum(t.quantity for t in trades) == 3        # only the 100 level
-    assert eng.book.orders[taker.order_id].quantity == 3  # remainder rests @100
-    assert eng.book.asks[101.0].total_quantity == 3       # 101 untouched
+    add(eng, 0, 1, Side.SELL, 100.0, 2)
+    trades = eng.process_event(market_order(1, 2, Side.BUY, 10))
+
+    assert sum(t.quantity for t in trades) == 2
+    assert eng.book.best_ask() is None
+    assert eng.book.best_bid() is None  # market orders never rest
 
 
-# --------------------------------------------------------------- partial fill
-def test_partial_fill_updates_resting_quantity():
+def test_cancel_removes_resting_order():
     eng = MatchingEngine()
-    resting = limit(Side.BUY, 100.0, 10)
-    eng.submit_limit_order(resting)
-    eng.submit_market_order(market(Side.SELL, 3))
-    assert eng.book.orders[resting.order_id].quantity == 7
-    assert eng.book.bids[100.0].total_quantity == 7
+    add(eng, 0, 1, Side.BUY, 99.0, 5)
+    assert eng.book.best_bid() == 99.0
 
-
-# --------------------------------------------------------------- cancellations
-def test_cancel_removes_order_and_level():
-    eng = MatchingEngine()
-    o = limit(Side.BUY, 100.0, 5)
-    eng.submit_limit_order(o)
-    assert eng.book.best_bid() == 100.0
-    cancelled = eng.cancel_order(o.order_id)
-    assert cancelled is o
+    removed = eng.cancel(1)
+    assert removed is True
     assert eng.book.best_bid() is None
-    assert o.order_id not in eng.book.orders
+    assert 1 not in eng.book.orders
 
 
-def test_cancel_one_of_two_keeps_level():
+def test_cancel_unknown_order_is_noop():
     eng = MatchingEngine()
-    a = limit(Side.BUY, 100.0, 5)
-    b = limit(Side.BUY, 100.0, 5)
-    eng.submit_limit_order(a)
-    eng.submit_limit_order(b)
-    eng.cancel_order(a.order_id)
-    assert eng.book.bids[100.0].total_quantity == 5
-    assert list(eng.book.bids[100.0].orders) == [b]
+    add(eng, 0, 1, Side.BUY, 99.0, 5)
+    assert eng.cancel(999) is False       # unknown id
+    assert eng.book.best_bid() == 99.0     # book unchanged
 
 
-def test_cancel_unknown_id_is_noop():
+def test_cancelled_order_no_longer_matches():
+    """A cancelled resting order must not participate in later matches."""
     eng = MatchingEngine()
-    assert eng.cancel_order(999) is None
+    add(eng, 0, 1, Side.SELL, 100.0, 5)
+    eng.cancel(1)
+    trades = eng.process_event(market_order(1, 2, Side.BUY, 5))
+    assert trades == []                    # nothing to match against
 
 
-def test_cancelled_order_is_skipped_in_matching():
+def test_trade_prints_at_resting_price():
+    """Aggressor gets price improvement; trade prints at the maker's price."""
     eng = MatchingEngine()
-    a = limit(Side.SELL, 100.0, 5, ts=1.0)
-    b = limit(Side.SELL, 100.0, 5, ts=2.0)
-    eng.submit_limit_order(a)
-    eng.submit_limit_order(b)
-    eng.cancel_order(a.order_id)          # remove the front-of-queue order
-    trades = eng.submit_market_order(market(Side.BUY, 5))
-    assert trades[0].maker_order_id == b.order_id  # now b is first
+    add(eng, 0, 1, Side.SELL, 100.0, 5)
+    trades = add(eng, 1, 2, Side.BUY, 105.0, 5)  # willing to pay up to 105
+    assert trades[0].price == 100.0              # but fills at the resting 100
+
+
+def test_book_invariants_under_random_flow():
+    """After a stream of random events the book stays internally consistent."""
+    eng = MatchingEngine()
+    rng = random.Random(123)
+    oid = 0
+    for ts in range(2000):
+        oid += 1
+        roll = rng.random()
+        side = Side.BUY if rng.random() < 0.5 else Side.SELL
+        qty = rng.randint(1, 5)
+        if roll < 0.6:
+            price = round(100 + rng.randint(-5, 5) * 0.5, 2)
+            eng.process_event(add_order(ts, oid, side, price, qty))
+        elif roll < 0.8:
+            eng.process_event(market_order(ts, oid, side, qty))
+        else:
+            # Cancel a random known order id (mostly no-ops, which is fine).
+            eng.cancel(rng.randint(1, oid))
+
+    book = eng.book
+    bid, ask = book.best_bid(), book.best_ask()
+
+    # 1. The book is never crossed.
+    if bid is not None and ask is not None:
+        assert bid < ask
+    # 2. Depths are non-negative and match the order lookup.
+    assert book.total_bid_depth() >= 0
+    assert book.total_ask_depth() >= 0
+    lookup_total = sum(o.remaining for o in book.orders.values())
+    assert lookup_total == book.total_bid_depth() + book.total_ask_depth()
+    # 3. Every resting order has positive remaining quantity.
+    assert all(o.remaining > 0 for o in book.orders.values())
+    # 4. Every id in a level is present in the lookup and vice versa.
+    level_ids = {o.order_id for lvl in list(book.bids.values()) + list(book.asks.values())
+                 for o in lvl}
+    assert level_ids == set(book.orders.keys())
